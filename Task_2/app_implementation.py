@@ -97,8 +97,43 @@ DATETIME_TOOL = {
     },
 }
 
-# Server-side tool: Anthropic executes it, no local code needed
-WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
+def web_search_tool(model: str) -> dict:
+    """Server-side tool: Anthropic executes it. Haiku 5.5 only supports the basic variant."""
+    version = "web_search_20250305" if model == "claude-haiku-5-5" else "web_search_20260209"
+    return {"type": version, "name": "web_search", "max_uses": 3}
+
+
+# ---------------------------------------------------------------- Model settings
+MODELS = {
+    "Claude Haiku 5.5": "claude-haiku-5-5",
+    "Claude Sonnet 5.5": "claude-sonnet-5-5",
+    "Claude Opus 5.5": "claude-opus-5-5",
+    "Claude Fable 5.2": "claude-fable-5-2",
+}
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+
+
+def build_request(model, messages, system, effort, thinking_on, tools):
+    """Combine model + messages + system + effort + thinking (+ tools) into one request."""
+    params = {
+        "model": model,
+        "max_tokens": 16000,
+        "system": system,
+        "messages": messages,
+        "tools": tools,
+        "output_config": {"effort": effort},
+    }
+    can_turn_off = effort in ("low", "medium", "high")
+    thinking_forced = False
+    if thinking_on:
+        params["thinking"] = {"type": "adaptive", "display": "summarized"}
+    elif model == "claude-haiku-5-5" and can_turn_off:
+        params["thinking"] = {"type": "disabled"}
+    elif model == "claude-sonnet-5-5" and can_turn_off:
+        params["thinking"] = {"type": "between_tools"}
+    else:
+        thinking_forced = True  # Opus 5.5 / Fable 5.2, or effort too high: can't disable
+    return params, thinking_forced
 
 
 # ---------------------------------------------------------------- MCP client
@@ -131,27 +166,48 @@ def _text(message) -> str:
     return "\n".join(b.text for b in message.content if b.type == "text")
 
 
-def chat(history: list[dict], user_text: str, index: VectorIndex, mcp_tools: list[dict]):
-    """history: list of {"role","content": str}. Returns (answer, tool_log)."""
+def chat(
+    history: list[dict],
+    user_text: str,
+    index: VectorIndex,
+    mcp_tools: list[dict],
+    model: str = MODEL,
+    effort: str = "medium",
+    thinking_on: bool = True,
+    extra_system: str = "",
+):
+    """history: list of {"role","content": str}.
+    Returns dict: answer, tool_log, thinking, usage (in/out tokens), request (params sent), forced."""
     context = retrieve_context(index, user_text)
     augmented = (
         f"<context>\n{context}\n</context>\n\n"
         f"Use the context above only if relevant.\n\nUser question: {user_text}"
     )
     work = [*history, {"role": "user", "content": augmented}]
-    tools = [DATETIME_TOOL, WEB_SEARCH_TOOL, *mcp_tools]
+    tools = [DATETIME_TOOL, web_search_tool(model), *mcp_tools]
     mcp_names = {t["name"] for t in mcp_tools}
-    tool_log = []
+    system = SYSTEM_PROMPT
+    if extra_system.strip():
+        system += f"\n\nAdditional instructions from the user:\n{extra_system.strip()}"
+    tool_log, thinking_parts = [], []
+    tokens_in = tokens_out = 0
+    preview, forced = build_request(model, [], system, effort, thinking_on, tools)
+    request_summary = {
+        k: v for k, v in preview.items() if k not in ("messages", "tools", "system")
+    } | {"tools": [t.get("name") for t in tools], "system_chars": len(system)}
 
     while True:
-        resp = client.messages.create(
-            model=MODEL, max_tokens=1500, system=SYSTEM_PROMPT, messages=work, tools=tools
-        )
+        params, _ = build_request(model, work, system, effort, thinking_on, tools)
+        resp = client.messages.create(**params)
+        tokens_in += resp.usage.input_tokens
+        tokens_out += resp.usage.output_tokens
         work.append({"role": "assistant", "content": resp.content})
 
-        for b in resp.content:  # web search is server-side; just log it
-            if b.type == "server_tool_use":
-                tool_log.append(f"web_search({b.input})")
+        for b in resp.content:
+            if b.type == "thinking" and b.thinking:
+                thinking_parts.append(b.thinking)
+            elif b.type == "server_tool_use":  # server-side tools (web search): just log them
+                tool_log.append(f"{b.name}({b.input})")
 
         if resp.stop_reason == "pause_turn":
             continue
@@ -178,4 +234,14 @@ def chat(history: list[dict], user_text: str, index: VectorIndex, mcp_tools: lis
             )
         work.append({"role": "user", "content": results})
 
-    return _text(resp), tool_log
+    answer = _text(resp)
+    if resp.stop_reason == "refusal" and not answer:
+        answer = "The model declined to answer this request."
+    return {
+        "answer": answer,
+        "tool_log": tool_log,
+        "thinking": "\n\n".join(thinking_parts),
+        "usage": (tokens_in, tokens_out),
+        "request": request_summary,
+        "forced": forced,
+    }
